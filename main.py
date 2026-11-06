@@ -1200,7 +1200,12 @@ class App(ctk.CTk):
 
             # Определяем тип 3D
             video_type = self.detect_3d_type(
-                width, height, video_stream, self.video_path, data.get("format", {}).get("tags", {})
+                width,
+                height,
+                video_stream,
+                filename=self.video_path,
+                format_tags=data.get("format", {}).get("tags", {}),
+                duration=duration
             )
 
             self.video_info = {
@@ -1231,10 +1236,90 @@ class App(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Ошибка анализа", str(e))
 
-    def detect_3d_type(self, width, height, stream, filename="", format_tags=None):
-        """Определяет 3D-формат по явным меткам имени файла и метаданным."""
-        # 1. Явная метка в имени файла обычно содержит точное обозначение
-        # Half/Full и SBS/TAB. Например: 3D-halfOU.mkv.
+    def _frame_similarity(self, img: Image.Image, mode: str = "lr") -> float:
+        """
+        Сравнивает две половины кадра.
+        mode='lr' — left/right (SBS)
+        mode='tb' — top/bottom (TAB)
+        Возвращает значение от 0.0 (совсем разные) до 1.0 (очень похожи).
+        """
+        img = img.convert("L")
+        w, h = img.size
+
+        if mode == "lr":
+            left = img.crop((0, 0, w // 2, h))
+            right = img.crop((w // 2, 0, w, h))
+            if left.size != right.size:
+                right = right.resize(left.size, Image.Resampling.BILINEAR)
+            a, b = left, right
+        else:
+            top = img.crop((0, 0, w, h // 2))
+            bottom = img.crop((0, h // 2, w, h))
+            if top.size != bottom.size:
+                bottom = bottom.resize(top.size, Image.Resampling.BILINEAR)
+            a, b = top, bottom
+
+        a = a.resize((64, 64), Image.Resampling.BILINEAR)
+        b = b.resize((64, 64), Image.Resampling.BILINEAR)
+
+        pixels_a = list(a.getdata())
+        pixels_b = list(b.getdata())
+        if not pixels_a:
+            return 0.0
+
+        diff = sum(abs(pa - pb) for pa, pb in zip(pixels_a, pixels_b)) / len(pixels_a)
+        similarity = max(0.0, 1.0 - (diff / 45.0))
+        return similarity
+
+    def _analyze_frame_content(self, video_path: str, duration: float) -> dict:
+        """
+        Извлекает 1–2 кадра прямо в память (без файлов на диске)
+        и оценивает, SBS это или TAB.
+        """
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg or duration <= 0:
+            return {"sbs_score": 0.0, "tab_score": 0.0}
+
+        timestamps = [max(1.0, duration * 0.15)]
+        if duration > 30:
+            timestamps.append(duration * 0.45)
+
+        sbs_scores = []
+        tab_scores = []
+
+        for ts in timestamps:
+            cmd = [
+                ffmpeg,
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{ts:.3f}",
+                "-i", video_path,
+                "-frames:v", "1",
+                "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"
+            ]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=20,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+                if result.returncode != 0 or not result.stdout:
+                    continue
+
+                with Image.open(BytesIO(result.stdout)) as img:
+                    img = img.convert("RGB")
+                    sbs_scores.append(self._frame_similarity(img, "lr"))
+                    tab_scores.append(self._frame_similarity(img, "tb"))
+            except Exception:
+                continue
+
+        return {
+            "sbs_score": sum(sbs_scores) / len(sbs_scores) if sbs_scores else 0.0,
+            "tab_score": sum(tab_scores) / len(tab_scores) if tab_scores else 0.0,
+        }
+
+    def _filename_3d_hint(self, filename: str):
+        """Слабая подсказка из имени файла. Не является окончательным решением."""
         base_name = os.path.basename(filename or "").lower()
         compact_name = re.sub(r"[^a-z0-9]+", "", base_name)
 
@@ -1246,9 +1331,23 @@ class App(ctk.CTk):
             return "Half SBS"
         if "fullsbs" in compact_name or "sbsfull" in compact_name:
             return "Full SBS"
+        if re.search(r"(?:^|[^a-z])sbs(?:[^a-z]|$)", compact_name) or "sidebyside" in compact_name:
+            return "SBS"
+        if re.search(r"(?:^|[^a-z])(?:ou|tab|tb)(?:[^a-z]|$)", compact_name) or "overunder" in compact_name:
+            return "TAB"
+        return None
 
-        # 2. Стереометаданные FFprobe: сначала теги видеопотока,
-        # затем теги контейнера. Они могут указывать расположение глаз.
+    def detect_3d_type(self, width, height, stream, filename="", format_tags=None, duration=0.0):
+        """
+        Определяет 3D-формат.
+        Приоритет:
+        1. Метаданные stereo_mode
+        2. Анализ содержимого кадра + разрешение
+        3. Имя файла — только подсказка, не перекрывает противоречия
+        """
+        aspect = width / height if height > 0 else 0
+        inv_aspect = height / width if width > 0 else 0
+
         tags = stream.get("tags", {}) or {}
         format_tags = format_tags or {}
         stereo_mode = " ".join([
@@ -1257,21 +1356,79 @@ class App(ctk.CTk):
         ]).lower().replace("-", "_").replace(" ", "_")
 
         if any(marker in stereo_mode for marker in ("left_right", "right_left", "side_by_side")):
-            return "Full SBS" if width / max(height, 1) > 2.5 else "Half SBS"
+            return "Full SBS" if aspect > 2.5 else "Half SBS"
 
         if any(marker in stereo_mode for marker in ("top_bottom", "bottom_top", "over_under")):
-            return "TAB (Top/Bottom; Half/Full не уточнён)"
+            return "Full TAB" if inv_aspect > 2.0 else "Half TAB"
 
-        # 3. По одному разрешению 1920x1080 нельзя надёжно различить
-        # обычное 2D, Half SBS и Half TAB — не выдаём догадку за факт.
-        aspect = width / height if height > 0 else 0
+        content = self._analyze_frame_content(filename or getattr(self, "video_path", "") or "", duration)
+        sbs = content["sbs_score"]
+        tab = content["tab_score"]
+
+        content_type = None
+        if sbs > 0.72 and sbs > tab + 0.12:
+            content_type = "Full SBS" if aspect > 2.6 else "Half SBS"
+        elif tab > 0.72 and tab > sbs + 0.12:
+            content_type = "Full TAB" if inv_aspect > 1.8 else "Half TAB"
+        elif sbs < 0.45 and tab < 0.45:
+            content_type = "Обычное 2D"
+
+        name_hint = self._filename_3d_hint(filename)
+
+        if content_type in ("Full SBS", "Half SBS", "Full TAB", "Half TAB", "Обычное 2D"):
+            if content_type.endswith("SBS") and name_hint in ("Full SBS", "Half SBS"):
+                if aspect > 2.6:
+                    return "Full SBS"
+                if aspect < 2.2:
+                    return "Half SBS"
+                return name_hint
+            if content_type.endswith("TAB") and name_hint in ("Full TAB", "Half TAB"):
+                if inv_aspect > 1.8:
+                    return "Full TAB"
+                if inv_aspect < 1.3:
+                    return "Half TAB"
+                return name_hint
+            return content_type
+
         if aspect > 2.8:
+            if name_hint in ("Full SBS", "Half SBS", "SBS", None):
+                return "Full SBS"
             return "Full SBS (предположительно)"
-        if 1.6 <= aspect <= 2.0 and width >= 1280:
-            return "Не определено: возможно 2D, Half SBS или Half TAB"
-        if aspect < 1.0:
-            return "Возможно TAB (Top/Bottom), Half/Full не определён"
+
+        if inv_aspect > 1.9:
+            if name_hint in ("Full TAB", "Half TAB", "TAB", None):
+                return "Full TAB"
+            return "Full TAB (предположительно)"
+
+        if name_hint == "Full SBS" and aspect > 2.4:
+            return "Full SBS"
+        if name_hint == "Half SBS" and 1.4 <= aspect <= 2.2:
+            return "Half SBS"
+        if name_hint == "Full TAB" and inv_aspect > 1.7:
+            return "Full TAB"
+        if name_hint == "Half TAB" and 0.7 <= inv_aspect <= 1.4:
+            return "Half TAB"
+        if name_hint == "SBS" and aspect > 2.4:
+            return "Full SBS"
+        if name_hint == "SBS" and 1.4 <= aspect <= 2.2:
+            return "Half SBS"
+        if name_hint == "TAB" and inv_aspect > 1.7:
+            return "Full TAB"
+        if name_hint == "TAB" and 0.7 <= inv_aspect <= 1.4:
+            return "Half TAB"
+
+        if name_hint == "Full SBS" and aspect < 2.3:
+            return "Не определено: имя файла указывает Full SBS, но разрешение не соответствует"
+
+        if 1.5 <= aspect <= 2.1:
+            if sbs >= 0.55 or tab >= 0.55:
+                return "Не определено: возможно 2D или Half SBS"
+            return "Обычное 2D"
+
         return "Обычное 2D (предположительно)"
+
+
+
 
     def _resolve_operation(self):
         selected = self.operation_var.get()
