@@ -18,6 +18,14 @@ try:
 except ImportError:  # pause/resume is enabled in builds made by build.py
     psutil = None
 
+try:
+    from tkinterdnd2 import COPY, REFUSE_DROP, DND_FILES, TkinterDnD
+except ImportError:  # drag-and-drop is enabled by build.py / requirements.txt
+    COPY = None
+    REFUSE_DROP = None
+    DND_FILES = None
+    TkinterDnD = None
+
 from encoding_profiles import (
     ConversionSettings,
     QualitySettings,
@@ -431,6 +439,7 @@ class App(ctk.CTk):
         self._layout_conversion_fields()
         self._on_operation_changed(self.operation_var.get())
         self._refresh_quality_value_field()
+        self._setup_drag_and_drop()
         self.bind("<Configure>", self._on_root_resize, add="+")
         self.protocol("WM_DELETE_WINDOW", self.on_window_close)
         self.after(150, self._apply_responsive_layout)
@@ -1028,6 +1037,113 @@ class App(ctk.CTk):
             "names": names,
         }
 
+    def _setup_drag_and_drop(self):
+        """Включает приём видеофайлов, перетаскиваемых из Проводника."""
+        if TkinterDnD is None or DND_FILES is None:
+            self.file_label.configure(
+                text="Файл не выбран",
+                text_color="gray60",
+            )
+            return
+
+        try:
+            # CustomTkinter использует обычный Tk root. tkinterdnd2 подключает
+            # расширение tkdnd к уже созданному окну, не заменяя CTk.
+            TkinterDnD.require(self)
+            self._register_drop_target_recursive(self)
+            self.file_label.configure(
+                text="Файл не выбран — перетащите видео в окно",
+                text_color="gray60",
+            )
+            self._drag_drop_enabled = True
+        except Exception as error:
+            # Отказ DnD не должен мешать обычному выбору файла через диалог.
+            self._drag_drop_enabled = False
+            self.file_label.configure(text="Файл не выбран", text_color="gray60")
+            print(f"Drag-and-drop недоступен: {error}")
+
+    def _register_drop_target_recursive(self, widget):
+        """Регистрирует все видимые области окна как drop targets."""
+        try:
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_video_drop)
+        except (AttributeError, tk.TclError):
+            # Некоторые внутренние виджеты CustomTkinter могут не принимать DnD.
+            pass
+
+        try:
+            children = widget.winfo_children()
+        except (AttributeError, tk.TclError):
+            children = []
+        for child in children:
+            self._register_drop_target_recursive(child)
+
+    def _on_video_drop(self, event):
+        """Принимает один видеофайл из внешнего приложения, например Explorer."""
+        if self._conversion_state != "idle":
+            messagebox.showwarning(
+                "Конвертация выполняется",
+                "Нельзя загружать другой файл, пока выполняется конвертация.",
+                parent=self,
+            )
+            return REFUSE_DROP
+
+        try:
+            dropped_paths = [
+                os.path.normpath(path)
+                for path in self.tk.splitlist(event.data)
+                if path and os.path.isfile(path)
+            ]
+        except (tk.TclError, TypeError):
+            dropped_paths = []
+
+        if not dropped_paths:
+            messagebox.showwarning(
+                "Файл не принят",
+                "Перетащите на окно один видеофайл.",
+                parent=self,
+            )
+            return REFUSE_DROP
+
+        if len(dropped_paths) > 1:
+            messagebox.showinfo(
+                "Выбрано несколько файлов",
+                "Сейчас программа обрабатывает одно видео за раз.\n\n"
+                "Перетащите один файл, чтобы загрузить его.",
+                parent=self,
+            )
+            return REFUSE_DROP
+
+        self._load_video_path(dropped_paths[0])
+        return COPY
+
+    def _load_video_path(self, path):
+        """Общая точка загрузки видео для диалога и drag-and-drop."""
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning(
+                "Файл не найден",
+                "Выбранный файл не существует или недоступен.",
+                parent=self,
+            )
+            return
+
+        supported_extensions = {".mp4", ".mkv", ".ts", ".avi", ".mov", ".m2ts", ".mts"}
+        extension = os.path.splitext(path)[1].lower()
+        if extension not in supported_extensions:
+            messagebox.showwarning(
+                "Неподдерживаемый тип файла",
+                "Поддерживаются видеофайлы: MP4, MKV, TS, AVI, MOV, M2TS и MTS.",
+                parent=self,
+            )
+            return
+
+        self.video_path = os.path.abspath(path)
+        self.file_label.configure(
+            text=os.path.basename(self.video_path),
+            text_color="gray85",
+        )
+        self.analyze_video()
+
     def select_video(self):
         path = filedialog.askopenfilename(
             title="Выберите видеофайл",
@@ -1037,9 +1153,7 @@ class App(ctk.CTk):
             ]
         )
         if path:
-            self.video_path = path
-            self.file_label.configure(text=os.path.basename(path))
-            self.analyze_video()
+            self._load_video_path(path)
 
     def analyze_video(self):
         if not self.video_path:

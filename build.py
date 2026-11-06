@@ -46,6 +46,8 @@ def ensure_build_dependencies() -> None:
     ensure_package("PyInstaller", "pyinstaller")
     # Нужен для приостановки и возобновления дочернего процесса FFmpeg.
     ensure_package("psutil", "psutil")
+    # Нативный drag-and-drop из Проводника Windows.
+    ensure_package("tkinterdnd2", "tkinterdnd2==0.6.4")
 
 
 def build(onefile: bool = False, console: bool = False) -> int:
@@ -80,6 +82,8 @@ def build(onefile: bool = False, console: bool = False) -> int:
         APP_NAME,
         "--collect-all",
         "customtkinter",
+        "--collect-all",
+        "tkinterdnd2",
         "--add-data",
         add_data,
         "--distpath",
@@ -97,6 +101,7 @@ def build(onefile: bool = False, console: bool = False) -> int:
     print(f"Сборка {APP_NAME} v{version}...")
     print("pubspec.yaml будет включён в ресурсы приложения.")
     print("psutil включён для управления паузой и остановкой FFmpeg.")
+    print("tkinterdnd2 включён для перетаскивания видео в окно приложения.")
     print("Команда сборки:")
     print(" ".join(f'"{part}"' if " " in part else part for part in command))
 

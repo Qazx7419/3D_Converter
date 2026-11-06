@@ -1,2 +1,4 @@
 customtkinter>=6.0.0
 Pillow>=11.0.0
+psutil>=6.0.0
+tkinterdnd2==0.6.4

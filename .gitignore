@@ -1,0 +1,5 @@
+# Local build output — excluded from Git
+
+/build/
+
+/dist/

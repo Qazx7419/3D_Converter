@@ -1,16 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+project_dir = Path(SPECPATH)
+
+datas = [(str(project_dir / 'pubspec.yaml'), '.')]
 binaries = []
 hiddenimports = []
-tmp_ret = collect_all('customtkinter')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+for package_name in ('customtkinter', 'tkinterdnd2'):
+    package_data = collect_all(package_name)
+    datas += package_data[0]
+    binaries += package_data[1]
+    hiddenimports += package_data[2]
 
 
 a = Analysis(
-    ['main.py'],
-    pathex=[],
+    [str(project_dir / 'main.py')],
+    pathex=[str(project_dir)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
