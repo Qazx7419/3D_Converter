@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from encoding_profiles import (
     ConversionSettings,
@@ -42,16 +43,32 @@ class EncodingProfileTests(unittest.TestCase):
         self.assertIn("-t", plan.command)
         self.assertEqual(plan.command[plan.command.index("-t") + 1], "120")
 
-    def test_full_sbs_nvenc_uses_reference_scale_and_auto_quality(self):
-        plan = self.plan("full_sbs_to_half_sbs", "nvenc")
-        self.assertIn("scale=1920:1080:flags=lanczos,format=yuv420p", plan.command)
+    def test_2d_to_ts_test_fragment_honors_start_and_duration(self):
+        plan = self.plan(
+            "remux_2d_to_ts", test_start_seconds=600, test_duration_seconds=6900
+        )
+        self.assertLess(plan.command.index("-ss"), plan.command.index("-i"))
+        self.assertEqual(plan.command[plan.command.index("-ss") + 1], "600")
+        self.assertEqual(plan.command[plan.command.index("-t") + 1], "6900")
+
+    def test_full_sbs_nvenc_uses_cuda_decode_scaling_and_auto_quality(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=True):
+            plan = self.plan("full_sbs_to_half_sbs", "nvenc")
+        self.assertEqual(plan.command[plan.command.index("-hwaccel") + 1], "cuda")
+        self.assertEqual(
+            plan.command[plan.command.index("-hwaccel_output_format") + 1], "cuda"
+        )
+        self.assertIn(
+            "scale_cuda=1920:1080:interp_algo=lanczos:format=nv12", plan.command
+        )
         self.assertIn("h264_nvenc", plan.command)
         self.assertIn("-cq", plan.command)
         self.assertIn("21", plan.command)
         self.assertIn("p5", plan.command)
 
     def test_full_sbs_qsv_uses_hardware_decode_vpp_and_hardware_encode(self):
-        plan = self.plan("full_sbs_to_half_sbs", "qsv")
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=True):
+            plan = self.plan("full_sbs_to_half_sbs", "qsv")
         self.assertEqual(
             plan.command[plan.command.index("-hwaccel") + 1], "qsv"
         )
@@ -69,32 +86,177 @@ class EncodingProfileTests(unittest.TestCase):
 
 
     def test_full_sbs_nvenc_does_not_use_qsv_vpp(self):
-        plan = self.plan("full_sbs_to_half_sbs", "nvenc")
-        self.assertIn("scale=1920:1080:flags=lanczos,format=yuv420p", plan.command)
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=True):
+            plan = self.plan("full_sbs_to_half_sbs", "nvenc")
+        self.assertIn(
+            "scale_cuda=1920:1080:interp_algo=lanczos:format=nv12", plan.command
+        )
         self.assertNotIn("vpp_qsv=w=1920:h=1080:format=nv12", plan.command)
         self.assertIn("h264_nvenc", plan.command)
 
-    def test_half_tab_nvenc_uses_original_geometry_filter(self):
-        plan = self.plan("half_tab_to_half_sbs", "nvenc")
+    def test_full_sbs_nvenc_falls_back_when_scale_cuda_is_unavailable(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=False):
+            plan = self.plan("full_sbs_to_half_sbs", "nvenc")
+        self.assertEqual(plan.command[plan.command.index("-hwaccel") + 1], "nvdec")
+        self.assertNotIn("-hwaccel_output_format", plan.command)
+        self.assertIn("scale=1920:1080:flags=lanczos,format=yuv420p", plan.command)
+        self.assertIn("software Lanczos fallback (GPU scaling unavailable)", plan.summary)
+
+    def test_half_tab_nvenc_uses_cuda_crop_scaling_and_composition(self):
+        def supports(_ffmpeg, filter_name):
+            return filter_name in {"scale_cuda", "overlay_cuda"}
+
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=supports):
+            plan = self.plan("half_tab_to_half_sbs", "nvenc")
+        self.assertEqual(plan.command[plan.command.index("-hwaccel") + 1], "cuda")
+        self.assertEqual(
+            plan.command[plan.command.index("-hwaccel_output_format") + 1], "cuda"
+        )
+        graph = plan.command[plan.command.index("-filter_complex") + 1]
+        self.assertIn("split=3[base_src][top_src][bottom_src]", graph)
+        self.assertIn("crop=iw:ih/2:0:0", graph)
+        self.assertIn("crop=iw:ih/2:0:ih/2", graph)
+        self.assertEqual(graph.count("scale_cuda="), 3)
+        self.assertEqual(graph.count("overlay_cuda="), 2)
+        self.assertIn("interp_algo=lanczos", graph)
+        self.assertIn("-map", plan.command)
+        self.assertIn("[vout]", plan.command)
+        self.assertIn("h264_nvenc", plan.command)
+        self.assertIn("CUDA crop + scaling + composition", plan.summary)
+
+    def test_half_tab_nvenc_falls_back_when_cuda_composition_is_unavailable(self):
+        def supports(_ffmpeg, filter_name):
+            return filter_name == "scale_cuda"  # overlay_cuda deliberately missing
+
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=supports):
+            plan = self.plan("half_tab_to_half_sbs", "nvenc")
+        self.assertEqual(plan.command[plan.command.index("-hwaccel") + 1], "nvdec")
+        self.assertNotIn("-hwaccel_output_format", plan.command)
         graph = plan.command[plan.command.index("-vf") + 1]
         self.assertIn("split[top][bottom]", graph)
+        self.assertIn("scale=960:1080:flags=lanczos", graph)
+        self.assertIn("software Lanczos fallback (GPU scaling unavailable)", plan.summary)
+
+    def test_half_tab_nvenc_software_fallback_when_cuda_filters_are_missing(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=False):
+            plan = self.plan("half_tab_to_half_sbs", "nvenc")
+        graph = plan.command[plan.command.index("-vf") + 1]
         self.assertIn("crop=iw:ih/2:0:0", graph)
         self.assertIn("crop=iw:ih/2:0:ih/2", graph)
         self.assertIn("hstack", graph)
         self.assertIn("format=yuv420p", graph)
         self.assertIn("h264_nvenc", plan.command)
 
-    def test_half_tab_qsv_uses_same_geometry_and_nv12_encoder_input(self):
-        plan = self.plan("half_tab_to_half_sbs", "qsv")
+    def test_half_tab_qsv_uses_vpp_crop_scaling_and_hstack_qsv(self):
+        def supports(_ffmpeg, filter_name):
+            return filter_name in {"vpp_qsv", "hstack_qsv"}
+
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=supports):
+            plan = self.plan("half_tab_to_half_sbs", "qsv")
+        self.assertEqual(plan.command[plan.command.index("-hwaccel") + 1], "qsv")
+        self.assertEqual(
+            plan.command[plan.command.index("-hwaccel_output_format") + 1], "qsv"
+        )
+        graph = plan.command[plan.command.index("-filter_complex") + 1]
+        self.assertIn("split=2[top_src][bottom_src]", graph)
+        self.assertIn("vpp_qsv=cw=iw:ch=ih/2:cx=0:cy=0:w=960:h=1080:format=nv12", graph)
+        self.assertIn("cy=ih/2:w=960:h=1080:format=nv12", graph)
+        self.assertIn("hstack_qsv=inputs=2:height=1080", graph)
+        self.assertIn("[vout]", plan.command)
+        self.assertIn("h264_qsv", plan.command)
+        self.assertIn("Intel VPP crop/scale + hstack_qsv", plan.summary)
+
+    def test_half_tab_qsv_falls_back_to_software_geometry_when_stack_filter_missing(self):
+        def supports(_ffmpeg, filter_name):
+            return filter_name == "vpp_qsv"  # hstack_qsv deliberately missing
+
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=supports):
+            plan = self.plan("half_tab_to_half_sbs", "qsv")
+        self.assertNotIn("-hwaccel", plan.command)
         graph = plan.command[plan.command.index("-vf") + 1]
         self.assertIn("split[top][bottom]", graph)
+        self.assertIn("scale=960:1080:flags=lanczos", graph)
+        self.assertIn("h264_qsv", plan.command)
+        self.assertIn("software Lanczos fallback (GPU scaling unavailable)", plan.summary)
+
+    def test_scaling_mode_defaults_to_automatic_hardware_when_available(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=True):
+            plan = self.plan("full_sbs_to_half_sbs", "nvenc")
+        self.assertIn("scale_cuda=1920:1080:interp_algo=lanczos:format=nv12", plan.command)
+        self.assertIn("NVIDIA CUDA hardware scaling", plan.summary)
+
+    def test_nvenc_software_scaling_can_be_forced(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=AssertionError("filter probe should be skipped")):
+            plan = self.plan("full_sbs_to_half_sbs", "nvenc", scaling_mode="cpu")
+        self.assertEqual(plan.command[plan.command.index("-hwaccel") + 1], "nvdec")
+        self.assertIn("scale=1920:1080:flags=lanczos,format=yuv420p", plan.command)
+        self.assertNotIn("scale_cuda", " ".join(plan.command))
+        self.assertIn("software Lanczos scaling (user-selected CPU)", plan.summary)
+
+    def test_qsv_software_scaling_can_be_forced(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=AssertionError("filter probe should be skipped")):
+            plan = self.plan("full_sbs_to_half_sbs", "qsv", scaling_mode="cpu")
+        self.assertNotIn("-hwaccel", plan.command)
+        self.assertIn("scale=1920:1080:flags=lanczos,format=nv12", plan.command)
+        self.assertIn("h264_qsv", plan.command)
+        self.assertIn("software Lanczos scaling (user-selected CPU)", plan.summary)
+
+    def test_nvenc_half_tab_software_scaling_can_be_forced(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=AssertionError("filter probe should be skipped")):
+            plan = self.plan("half_tab_to_half_sbs", "nvenc", scaling_mode="cpu")
+        graph = plan.command[plan.command.index("-vf") + 1]
         self.assertIn("crop=iw:ih/2:0:0", graph)
-        self.assertIn("crop=iw:ih/2:0:ih/2", graph)
+        self.assertIn("scale=960:1080:flags=lanczos", graph)
         self.assertIn("hstack", graph)
+        self.assertNotIn("-filter_complex", plan.command)
+        self.assertIn("software Lanczos scaling (user-selected CPU)", plan.summary)
+
+    def test_qsv_half_tab_software_scaling_can_be_forced(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", side_effect=AssertionError("filter probe should be skipped")):
+            plan = self.plan("half_tab_to_half_sbs", "qsv", scaling_mode="cpu")
+        graph = plan.command[plan.command.index("-vf") + 1]
+        self.assertIn("crop=iw:ih/2:0:0", graph)
+        self.assertIn("scale=960:1080:flags=lanczos", graph)
         self.assertIn("format=nv12", graph)
         self.assertIn("h264_qsv", plan.command)
-        self.assertIn("-global_quality", plan.command)
-        self.assertNotIn("-hwaccel", plan.command)  # software filter path, QSV encode
+        self.assertIn("software Lanczos scaling (user-selected CPU)", plan.summary)
+
+    def test_gpu_scaling_can_be_forced(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=True):
+            plan = self.plan("full_sbs_to_half_sbs", "nvenc", scaling_mode="gpu")
+        self.assertIn("scale_cuda=1920:1080:interp_algo=lanczos:format=nv12", plan.command)
+        self.assertIn("NVIDIA CUDA hardware scaling", plan.summary)
+
+    def test_forced_gpu_scaling_fails_clearly_when_filter_missing(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=False):
+            with self.assertRaisesRegex(ValueError, "Принудительное GPU-масштабирование недоступно"):
+                self.plan("full_sbs_to_half_sbs", "nvenc", scaling_mode="gpu")
+
+    def test_auto_scaling_falls_back_to_cpu_when_hardware_filters_are_missing(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=False):
+            plan = self.plan("full_sbs_to_half_sbs", "nvenc", scaling_mode="auto")
+        self.assertIn("scale=1920:1080:flags=lanczos,format=yuv420p", plan.command)
+        self.assertIn("GPU scaling unavailable", plan.summary)
+
+    def test_invalid_scaling_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Неизвестный режим масштабирования"):
+            self.plan("full_sbs_to_half_sbs", "nvenc", scaling_mode="gpu_magic")
+
+    def test_test_interval_start_is_before_input_and_duration_is_exact(self):
+        plan = self.plan(
+            "full_sbs_to_half_sbs", "nvenc",
+            test_start_seconds=1433, test_duration_seconds=3068,
+        )
+        self.assertLess(plan.command.index("-ss"), plan.command.index("-i"))
+        self.assertEqual(plan.command[plan.command.index("-ss") + 1], "1433")
+        self.assertEqual(plan.command[plan.command.index("-t") + 1], "3068")
+
+    def test_qsv_full_sbs_falls_back_when_vpp_filter_is_unavailable(self):
+        with patch("encoding_profiles._ffmpeg_supports_filter", return_value=False):
+            plan = self.plan("full_sbs_to_half_sbs", "qsv")
+        self.assertNotIn("-hwaccel", plan.command)
+        self.assertIn("scale=1920:1080:flags=lanczos,format=nv12", plan.command)
+        self.assertIn("software Lanczos fallback (GPU scaling unavailable)", plan.summary)
 
     def test_qsv_vbr_size_mode_has_extbrc(self):
         plan = self.plan(

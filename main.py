@@ -36,6 +36,7 @@ from encoding_profiles import (
 from output_path_utils import ensure_required_extension, next_available_variant
 from preset_options import preset_options_for_encoder, recommended_preset
 from quality_value_help import build_quality_field_help, apply_quality_field_state
+from test_interval import parse_test_interval
 
 
 def load_project_version():
@@ -79,7 +80,7 @@ class App(ctk.CTk):
 
         self.app_version = load_project_version()
         self.title("3D Converter — Автоопределение")
-        self.minsize(900, 560)
+        self.minsize(900, 620)
 
         # Восстанавливаем геометрию последнего обычного окна. Настройки хранятся
         # отдельно от папки программы, поэтому работают и для будущей EXE-сборки.
@@ -87,6 +88,12 @@ class App(ctk.CTk):
         saved_window_state = self._load_window_state()
         self._last_normal_geometry = saved_window_state["geometry"]
         self._restore_maximized = saved_window_state["maximized"]
+        saved_scaling_mode = saved_window_state.get("scaling_mode", "auto")
+        self._saved_scaling_mode = {
+            "auto": "Авто (GPU)", "gpu": "GPU", "cpu": "CPU",
+            # Migrate the v1.0.22 two-mode setting.
+            "software": "CPU",
+        }.get(saved_scaling_mode, "Авто (GPU)")
         self.geometry(self._last_normal_geometry)
 
         self.video_path = None
@@ -108,6 +115,8 @@ class App(ctk.CTk):
         self._last_layout_columns = None
         self._quality_tooltip_job = None
         self._quality_tooltip_window = None
+        self._help_tooltip_job = None
+        self._help_tooltip_window = None
 
         # Корневой grid: шапка и нижние панели имеют фиксированную высоту,
         # центральная область забирает всё оставшееся место.
@@ -286,17 +295,22 @@ class App(ctk.CTk):
         )
         self.preview_btn.grid(row=4, column=0, pady=(0, 6))
 
-        # === Параметры: всегда находятся в окне, без основной прокрутки ===
+        # === Единая нижняя панель настроек конвертации ===
         self.conversion_frame = ctk.CTkFrame(self)
         self.conversion_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 4))
-        self.conversion_frame.grid_columnconfigure(0, weight=1)
+        for col in range(4):
+            self.conversion_frame.grid_columnconfigure(
+                col, weight=1, uniform="conversion_header"
+            )
 
         self.conversion_title = ctk.CTkLabel(
             self.conversion_frame,
             text="Параметры конвертации",
             font=ctk.CTkFont(size=14, weight="bold")
         )
-        self.conversion_title.grid(row=0, column=0, pady=(5, 3))
+        self.conversion_title.grid(
+            row=0, column=0, columnspan=3, sticky="ew", pady=(5, 3)
+        )
 
         self.operation_var = tk.StringVar(master=self, value="Авто по формату")
         self.encoder_var = tk.StringVar(master=self, value="Авто")
@@ -304,6 +318,7 @@ class App(ctk.CTk):
         self.audio_var = tk.StringVar(master=self, value="AC3 448 kbps")
         self.quality_mode_var = tk.StringVar(master=self, value="Авто (Magic)")
         self._last_quality_mode_label = self.quality_mode_var.get()
+        self.scaling_mode_var = tk.StringVar(master=self, value=self._saved_scaling_mode)
 
         self.fields_frame = ctk.CTkFrame(self.conversion_frame, fg_color="transparent")
         self.fields_frame.grid(row=1, column=0, sticky="ew", padx=7, pady=(0, 2))
@@ -368,15 +383,52 @@ class App(ctk.CTk):
         )
         self.preset_menu.pack(fill="x")
 
+        self.scaling_frame = ctk.CTkFrame(self.conversion_frame, fg_color="transparent")
+        self.scaling_label = ctk.CTkLabel(
+            self.scaling_frame, text="Масштабирование  ⓘ", anchor="w"
+        )
+        self.scaling_label.pack(fill="x", pady=(0, 1))
+        self.scaling_label.bind("<Enter>", lambda _event: self._schedule_help_tooltip(
+            self.scaling_label, self._scaling_help_text
+        ))
+        self.scaling_label.bind("<Leave>", self._hide_help_tooltip)
+        self.scaling_menu = ctk.CTkOptionMenu(
+            self.scaling_frame,
+            values=["Авто (GPU)", "GPU", "CPU"],
+            variable=self.scaling_mode_var,
+            command=self._on_scaling_mode_changed,
+            height=30,
+            font=ctk.CTkFont(size=11),
+            dropdown_font=ctk.CTkFont(size=11),
+        )
+        self.scaling_menu.pack(fill="x")
+        # Масштабирование размещается в шапке панели, над колонкой аудио.
+        self.scaling_frame.grid(
+            row=0, column=3, sticky="ew", padx=(4, 7), pady=(5, 2)
+        )
+
         self.test_frame = ctk.CTkFrame(self.fields_frame, fg_color="transparent")
         self.test_var = tk.BooleanVar(master=self, value=False)
+        self.test_top_frame = ctk.CTkFrame(self.test_frame, fg_color="transparent")
+        self.test_top_frame.pack(fill="x", pady=(0, 1))
         self.test_checkbox = ctk.CTkCheckBox(
-            self.test_frame, text="Тестовый фрагмент", variable=self.test_var,
+            self.test_top_frame, text="Тестовый фрагмент", variable=self.test_var,
             height=26, font=ctk.CTkFont(size=12)
         )
-        self.test_checkbox.pack(anchor="w", pady=(0, 1))
+        self.test_checkbox.pack(side="left", anchor="w")
+        self.test_help_label = ctk.CTkLabel(
+            self.test_top_frame, text="ⓘ", width=18, anchor="w",
+            text_color="gray70", font=ctk.CTkFont(size=12, weight="bold")
+        )
+        self.test_help_label.pack(side="left", padx=(3, 0))
+        self.test_help_label.bind("<Enter>", lambda _event: self._schedule_help_tooltip(
+            self.test_help_label, self._test_fragment_help_text
+        ))
+        self.test_help_label.bind("<Leave>", self._hide_help_tooltip)
         self.test_minutes_entry = ctk.CTkEntry(
-            self.test_frame, placeholder_text="Минуты (по умолчанию 2)", height=30
+            self.test_frame,
+            placeholder_text="25 | 10 - 125 | 0:23:53 - 1:15:01",
+            height=30,
         )
         self.test_minutes_entry.pack(fill="x")
 
@@ -446,6 +498,104 @@ class App(ctk.CTk):
         if self._restore_maximized:
             self.after(250, self._restore_maximized_window)
 
+    @staticmethod
+    def _scaling_help_text():
+        return (
+            "Авто (GPU) — программа сама выбирает аппаратное масштабирование, если "
+            "оно поддерживается текущей видеокартой и сборкой FFmpeg. NVIDIA использует "
+            "CUDA-фильтры, Intel — VPP. Если подходящих фильтров нет, автоматически "
+            "включается программный Lanczos на CPU.\n\n"
+            "GPU — принудительно использовать аппаратное масштабирование. Если нужные "
+            "фильтры недоступны, программа покажет ошибку и не начнёт конвертацию.\n\n"
+            "CPU — масштабировать программно фильтром Lanczos. Аппаратное кодирование "
+            "NVENC/QSV при этом остаётся включённым."
+        )
+
+    @staticmethod
+    def _test_fragment_help_text():
+        return (
+            "Задайте нужный отрезок видео одним из способов:\n\n"
+            "25 — первые 25 минут от начала видео.\n"
+            "10 - 125 — от 10-й до 125-й минуты.\n"
+            "0:23:53 - 1:15:01 — от 00:23:53 до 01:15:01.\n\n"
+            "Для времени поддерживаются форматы ЧЧ:ММ:СС и ММ:СС. "
+            "Разделитель диапазона — дефис. Если оставить поле пустым, "
+            "будут использованы первые 2 минуты. Конец отрезка не должен выходить "
+            "за длительность исходного видео."
+        )
+
+    def _scaling_mode_code(self):
+        return {"Авто (GPU)": "auto", "GPU": "gpu", "CPU": "cpu"}.get(
+            self.scaling_mode_var.get(), "auto"
+        )
+
+    def _on_scaling_mode_changed(self, selected=None):
+        # Сохраняем выбор сразу, чтобы он переживал перезапуск приложения.
+        self._save_window_state()
+
+    def _schedule_help_tooltip(self, anchor_widget, text_provider):
+        if self._help_tooltip_job is not None:
+            try:
+                self.after_cancel(self._help_tooltip_job)
+            except Exception:
+                pass
+        self._help_tooltip_job = self.after(
+            350, lambda: self._show_help_tooltip(anchor_widget, text_provider)
+        )
+
+    def _show_help_tooltip(self, anchor_widget, text_provider):
+        self._help_tooltip_job = None
+        if not self.winfo_exists() or not anchor_widget.winfo_exists():
+            return
+        self._hide_help_tooltip()
+        tooltip = tk.Toplevel(self)
+        tooltip.wm_overrideredirect(True)
+        try:
+            tooltip.attributes("-topmost", True)
+        except Exception:
+            pass
+        label = tk.Label(
+            tooltip,
+            text=text_provider(),
+            justify="left",
+            anchor="w",
+            wraplength=560,
+            bg="#252525",
+            fg="#f2f2f2",
+            relief="solid",
+            borderwidth=2,
+            padx=16,
+            pady=14,
+            font=("Segoe UI", 12),
+        )
+        label.pack()
+        tooltip.update_idletasks()
+        x = anchor_widget.winfo_rootx()
+        y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 5
+        tip_width = tooltip.winfo_reqwidth()
+        tip_height = tooltip.winfo_reqheight()
+        screen_width = tooltip.winfo_screenwidth()
+        screen_height = tooltip.winfo_screenheight()
+        x = max(6, min(x, screen_width - tip_width - 6))
+        if y + tip_height > screen_height - 6:
+            y = max(6, anchor_widget.winfo_rooty() - tip_height - 5)
+        tooltip.geometry(f"+{x}+{y}")
+        self._help_tooltip_window = tooltip
+
+    def _hide_help_tooltip(self, _event=None):
+        if self._help_tooltip_job is not None:
+            try:
+                self.after_cancel(self._help_tooltip_job)
+            except Exception:
+                pass
+            self._help_tooltip_job = None
+        if self._help_tooltip_window is not None:
+            try:
+                self._help_tooltip_window.destroy()
+            except Exception:
+                pass
+            self._help_tooltip_window = None
+
     def _make_option(self, parent, label, variable, values):
         """Создаёт адаптивный блок с подписью и выпадающим списком."""
         frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -477,6 +627,7 @@ class App(ctk.CTk):
             self.audio_menu,
             self.quality_menu,
             self.preset_menu,
+            self.scaling_menu,
         ):
             widget.configure(state=state)
         self._refresh_quality_value_field()
@@ -633,6 +784,19 @@ class App(ctk.CTk):
         if columns == self._last_layout_columns:
             return
         self._last_layout_columns = columns
+
+        # Шапка панели использует ту же сетку: заголовок занимает все колонки,
+        # кроме последней, а масштабирование стоит над последним полем.
+        for col in range(4):
+            self.conversion_frame.grid_columnconfigure(
+                col, weight=1 if col < columns else 0,
+                uniform="conversion_header" if col < columns else ""
+            )
+        self.conversion_title.grid_configure(column=0, columnspan=max(1, columns - 1))
+        self.scaling_frame.grid_configure(column=columns - 1)
+        self.fields_frame.grid_configure(columnspan=columns)
+        self.conversion_row3.grid_configure(columnspan=columns)
+
         for child in self.fields_frame.grid_slaves():
             child.grid_forget()
         # Сбрасываем старые веса, иначе после перехода с 4 колонок на 2
@@ -657,14 +821,19 @@ class App(ctk.CTk):
 
     def _load_window_state(self):
         """Загружает размер/позицию и проверяет, что окно останется видимым."""
-        default = {"geometry": "1360x900+60+40", "maximized": False}
+        default = {"geometry": "1360x900+60+40", "maximized": False, "scaling_mode": "auto"}
         try:
             with open(self._window_state_path, "r", encoding="utf-8") as settings_file:
                 data = json.load(settings_file)
             geometry = str(data.get("geometry", default["geometry"]))
+            saved_scaling_mode = data.get("scaling_mode", "auto")
+            if saved_scaling_mode == "software":  # migrate v1.0.22
+                saved_scaling_mode = "cpu"
+            if saved_scaling_mode not in {"auto", "gpu", "cpu"}:
+                saved_scaling_mode = "auto"
             match = re.fullmatch(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", geometry)
             if not match:
-                return default
+                return {**default, "scaling_mode": saved_scaling_mode}
 
             width, height, x, y = map(int, match.groups())
             screen_width = self.winfo_screenwidth()
@@ -682,6 +851,7 @@ class App(ctk.CTk):
             return {
                 "geometry": safe_geometry,
                 "maximized": bool(data.get("maximized", False)),
+                "scaling_mode": saved_scaling_mode,
             }
         except (OSError, ValueError, TypeError, AttributeError, tk.TclError, json.JSONDecodeError):
             return default
@@ -701,6 +871,10 @@ class App(ctk.CTk):
             payload = {
                 "geometry": geometry,
                 "maximized": window_state == "zoomed",
+                "scaling_mode": (
+                    self._scaling_mode_code()
+                    if hasattr(self, "scaling_mode_var") else "auto"
+                ),
             }
             temporary_path = self._window_state_path + ".tmp"
             with open(temporary_path, "w", encoding="utf-8") as settings_file:
@@ -787,6 +961,10 @@ class App(ctk.CTk):
         for field_frame in self._conversion_field_frames:
             field_frame.grid_configure(padx=3 if compact else 4,
                                        pady=1 if compact else 3)
+        self.scaling_frame.grid_configure(
+            padx=(3, 5) if compact else (4, 7),
+            pady=(3, 1) if compact else (5, 2)
+        )
 
         # Оставляем за содержимым центральную часть окна, а не заставляем
         # всю страницу расти по минимальной высоте внутренних виджетов.
@@ -806,6 +984,8 @@ class App(ctk.CTk):
             self._request_conversion_stop(show_message=False)
             return
 
+        self._hide_help_tooltip()
+        self._hide_quality_tooltip()
         self._save_window_state()
         self.destroy()
 
@@ -1175,7 +1355,10 @@ class App(ctk.CTk):
                 "-show_format", "-show_streams",
                 self.video_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             
             if result.returncode != 0:
                 raise Exception("Не удалось проанализировать файл")
@@ -1634,13 +1817,14 @@ class App(ctk.CTk):
             )
             is_remux = operation == "remux_2d_to_ts"
             audio_mode = "copy" if is_remux or self.audio_var.get() == "Копировать оригинал" else "ac3"
+            test_start = None
             test_duration = None
             if self.test_var.get():
-                raw_minutes = self.test_minutes_entry.get().strip().replace(",", ".")
-                minutes = float(raw_minutes) if raw_minutes else 2.0
-                if minutes <= 0:
-                    raise ProfileError("Длительность тестового фрагмента должна быть больше нуля.")
-                test_duration = int(round(minutes * 60))
+                test_start, test_duration = parse_test_interval(
+                    self.test_minutes_entry.get(),
+                    default_duration_seconds=120,
+                    media_duration_seconds=float(self.video_info.get("duration", 0) or 0),
+                )
 
             settings = ConversionSettings(
                 input_path=self.video_path,
@@ -1650,6 +1834,8 @@ class App(ctk.CTk):
                 audio_mode=audio_mode,
                 quality=QualitySettings() if is_remux else self._quality_settings(),
                 test_duration_seconds=test_duration,
+                test_start_seconds=test_start,
+                scaling_mode=self._scaling_mode_code(),
             )
             source = SourceInfo(
                 height=int(self.video_info.get("height", 0)),
@@ -1979,6 +2165,220 @@ class App(ctk.CTk):
         minutes, whole_seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}"
 
+    def _show_themed_result_dialog(
+        self,
+        *,
+        title,
+        status_text,
+        operation_text,
+        elapsed_text,
+        output_path=None,
+        note=None,
+        icon_text="✓",
+        status_color="#1f6aa5",
+    ):
+        """Показывает модальное окно результата в цветах основного интерфейса."""
+        previous_alpha = None
+        try:
+            previous_alpha = float(self.attributes("-alpha"))
+            self.attributes("-alpha", 0.70)
+        except (tk.TclError, TypeError, ValueError):
+            previous_alpha = None
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.configure(fg_color="#242424")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+
+        # Общая поверхность диалога повторяет тёмные панели основного окна.
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(
+            dialog,
+            fg_color="#2b2b2b",
+            corner_radius=10,
+            border_width=1,
+            border_color="#383838",
+        )
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 10))
+        header.grid_columnconfigure(1, weight=1)
+
+        icon_badge = ctk.CTkFrame(
+            header,
+            width=46,
+            height=46,
+            corner_radius=23,
+            fg_color=status_color,
+        )
+        icon_badge.grid(row=0, column=0, padx=(14, 12), pady=12)
+        icon_badge.grid_propagate(False)
+        ctk.CTkLabel(
+            icon_badge,
+            text=icon_text,
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#ffffff",
+        ).place(relx=0.5, rely=0.48, anchor="center")
+
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.grid(row=0, column=1, sticky="ew", pady=10)
+        title_box.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            title_box,
+            text=title,
+            font=ctk.CTkFont(size=17, weight="bold"),
+            text_color="#f2f2f2",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(
+            title_box,
+            text=status_text,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#ffffff",
+            fg_color=status_color,
+            corner_radius=5,
+            width=86,
+            height=23,
+        ).grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 10))
+        body.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            body,
+            text="Операция",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#a8a8a8",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", pady=(2, 4))
+        ctk.CTkLabel(
+            body,
+            text=operation_text,
+            font=ctk.CTkFont(size=12),
+            text_color="#ededed",
+            justify="left",
+            anchor="w",
+            wraplength=590,
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+        time_card = ctk.CTkFrame(
+            body,
+            fg_color="#1d1d1d",
+            corner_radius=8,
+            border_width=1,
+            border_color="#353535",
+        )
+        time_card.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        ctk.CTkLabel(
+            time_card,
+            text="Время конвертации",
+            font=ctk.CTkFont(size=11),
+            text_color="#a8a8a8",
+        ).pack(anchor="w", padx=12, pady=(9, 1))
+        ctk.CTkLabel(
+            time_card,
+            text=elapsed_text,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffffff",
+        ).pack(anchor="w", padx=12, pady=(0, 9))
+
+        if output_path:
+            ctk.CTkLabel(
+                body,
+                text="Файл сохранён" if status_text == "ГОТОВО" else "Частичный файл оставлен на диске",
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color="#a8a8a8",
+                anchor="w",
+            ).grid(row=3, column=0, sticky="w", pady=(0, 4))
+            path_card = ctk.CTkFrame(
+                body,
+                fg_color="#1d1d1d",
+                corner_radius=8,
+                border_width=1,
+                border_color="#353535",
+            )
+            path_card.grid(row=4, column=0, sticky="ew", pady=(0, 7))
+            ctk.CTkLabel(
+                path_card,
+                text=output_path,
+                font=ctk.CTkFont(size=11),
+                text_color="#d8e8f7",
+                justify="left",
+                anchor="w",
+                wraplength=590,
+            ).pack(fill="x", padx=12, pady=10)
+
+        if note:
+            ctk.CTkLabel(
+                body,
+                text=note,
+                font=ctk.CTkFont(size=11),
+                text_color="#d0a866",
+                justify="left",
+                anchor="w",
+                wraplength=590,
+            ).grid(row=5, column=0, sticky="ew", pady=(4, 0))
+
+        footer = ctk.CTkFrame(dialog, fg_color="#2b2b2b", corner_radius=0)
+        footer.grid(row=2, column=0, sticky="ew", padx=0, pady=(4, 0))
+        footer.grid_columnconfigure(0, weight=1)
+
+        def close_dialog(_event=None):
+            try:
+                if dialog.grab_current() is dialog:
+                    dialog.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+            try:
+                self.attributes("-alpha", previous_alpha if previous_alpha is not None else 1.0)
+                self.lift()
+                self.focus_force()
+            except tk.TclError:
+                pass
+
+        ok_button = ctk.CTkButton(
+            footer,
+            text="Хорошо",
+            width=118,
+            height=34,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#1f6aa5",
+            hover_color="#185783",
+            command=close_dialog,
+        )
+        ok_button.grid(row=0, column=0, sticky="e", padx=16, pady=12)
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.bind("<Escape>", close_dialog)
+        dialog.bind("<Return>", close_dialog)
+
+        # Центрируем относительно главного окна после расчёта реального размера.
+        dialog.update_idletasks()
+        self.update_idletasks()
+        width = max(620, dialog.winfo_reqwidth())
+        height = dialog.winfo_reqheight()
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_w = self.winfo_width()
+        parent_h = self.winfo_height()
+        x = parent_x + max(0, (parent_w - width) // 2)
+        y = parent_y + max(0, (parent_h - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.deiconify()
+        dialog.lift()
+        try:
+            dialog.grab_set()
+            ok_button.focus_set()
+        except tk.TclError:
+            pass
+        self.wait_window(dialog)
+
     def _conversion_finished(self, success, plan, details, return_code, conversion_seconds):
         """Завершает UI-состояние конвертации, включая отмену пользователем."""
         was_stopped = self._stop_requested
@@ -2018,7 +2418,20 @@ class App(ctk.CTk):
                 )
             else:
                 message += "\nВыходной файл не был создан."
-            messagebox.showinfo("Конвертация остановлена", message, parent=self)
+            partial_path = plan.output_path if os.path.isfile(plan.output_path) else None
+            self._show_themed_result_dialog(
+                title="Конвертация остановлена",
+                status_text="ОСТАНОВЛЕНО",
+                operation_text="Конвертация остановлена пользователем.",
+                elapsed_text=elapsed_report,
+                output_path=partial_path,
+                note=(
+                    "Файл может быть неполным или не воспроизводиться."
+                    if partial_path else "Выходной файл не был создан."
+                ),
+                icon_text="Ⅱ",
+                status_color="#a87832",
+            )
             return
 
         if success:
@@ -2027,12 +2440,14 @@ class App(ctk.CTk):
             self.conversion_timer.configure(
                 text=f"Прошло {elapsed_clock}\nОсталось 00:00:00"
             )
-            messagebox.showinfo(
-                "Конвертация завершена",
-                f"Операция: {plan.summary}\n\n"
-                f"Время конвертации: {elapsed_report}\n\n"
-                f"Файл сохранён:\n{plan.output_path}",
-                parent=self,
+            self._show_themed_result_dialog(
+                title="Конвертация завершена",
+                status_text="ГОТОВО",
+                operation_text=plan.summary,
+                elapsed_text=elapsed_report,
+                output_path=plan.output_path,
+                icon_text="✓",
+                status_color="#1f6aa5",
             )
         else:
             self.conversion_status.configure(text=f"Ошибка ({return_code})")
